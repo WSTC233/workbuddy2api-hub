@@ -45,6 +45,29 @@ EXPECTED_LEGS = (
     "windows-latest / python 3.12",
 )
 
+# 本机外挂层：只在开发机上由 start-hidden.vbs 拉起，**不进便携包**。
+#
+# 这四个文件是独立入口脚本，仓库里没有任何模块 import 它们（wb_proxy.py 也不
+# import），所以便携包少了它们照样能跑代理；反过来，把它们塞进包里会出问题：
+# wb_tray.py 顶格 import pystray 与 PIL，而便携运行时按设计把
+# Lib/site-packages 裁掉（见 release/portable_runtime.py 的 FORBIDDEN_PATHS），
+# 托盘在用户机器上必然 import 失败。
+#
+# 写在这里而不是 ignore 掉，是为了让"发布产物不含这层"成为被断言的契约：
+# 清单少登记一个真模块仍然会红，而这四个名字不会被误当成漏登记。
+LOCAL_ONLY_MODULES = (
+    "wb_429_fixer.py",
+    "wb_tray.py",
+    "wb_updater_web.py",
+    "wb_watchdog.py",
+)
+
+
+def portable_modules():
+    """仓库根目录里真正随包发布的 wb_*.py。"""
+    return sorted(path for path in glob.glob(os.path.join(ROOT, "wb_*.py"))
+                  if os.path.basename(path) not in LOCAL_ONLY_MODULES)
+
 
 def read(*parts):
     with open(os.path.join(ROOT, *parts), encoding="utf-8") as fh:
@@ -239,10 +262,23 @@ class ManifestTests(unittest.TestCase):
         # The regression this list exists for: a new wb_*.py that nobody
         # remembered to add would otherwise be missing from the release, and
         # the launcher would fail with ModuleNotFoundError on a user's machine.
-        on_disk = sorted(os.path.basename(p) for p in glob.glob(os.path.join(ROOT, "wb_*.py")))
+        # LOCAL_ONLY_MODULES 是本机外挂层，按定义不随包发（见文件头注释）。
+        on_disk = sorted(os.path.basename(p) for p in portable_modules())
         self.assertTrue(on_disk, "仓库里没有 wb_*.py？")
         listed = set(tools.read_manifest())
         self.assertEqual([n for n in on_disk if n not in listed], [])
+
+    def test_local_only_modules_exist_and_are_not_listed(self):
+        """名单必须指向真实文件，且真的没被登进便携清单。
+
+        名单过期（文件删了/改名了）会让上面那条断言悄悄放行一个本该发布的
+        模块，所以这里两头都卡死。
+        """
+        for name in LOCAL_ONLY_MODULES:
+            self.assertTrue(os.path.isfile(os.path.join(ROOT, name)),
+                            "%s 在 LOCAL_ONLY_MODULES 里但仓库里没有它" % name)
+            self.assertNotIn(name, tools.read_manifest(),
+                             "%s 标注为本机外挂层，却出现在便携清单里" % name)
 
     def test_launchers_and_dashboard_are_listed(self):
         listed = tools.read_manifest()
@@ -321,10 +357,13 @@ class RuntimeTrimTests(unittest.TestCase):
     """The trim rules reproduce the runtime the existing package ships."""
 
     def test_the_app_modules_survive_the_trim(self):
-        # Every stdlib module the gateway imports has to be in the contract
-        # list, or the trim could drop the thing it depends on.
+        # Every stdlib module the shipped gateway imports has to be in the
+        # contract list, or the trim could drop the thing it depends on.
+        # LOCAL_ONLY_MODULES 不随包发，它们的依赖（pystray/PIL 等）也从不在
+        # 便携运行时里，所以这里只走真正发布的模块。
         imported = set()
-        for path in glob.glob(os.path.join(ROOT, "wb_*.py")):
+        shipped = portable_modules()
+        for path in shipped:
             with open(path, encoding="utf-8") as fh:
                 tree = ast.parse(fh.read())
             for node in ast.walk(tree):
@@ -332,7 +371,7 @@ class RuntimeTrimTests(unittest.TestCase):
                     imported.update(a.name.split(".")[0] for a in node.names)
                 elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
                     imported.add(node.module.split(".")[0])
-        local = {os.path.basename(p)[:-3] for p in glob.glob(os.path.join(ROOT, "wb_*.py"))}
+        local = {os.path.basename(p)[:-3] for p in shipped}
         # sys / time and friends are compiled into python312.dll, so the trim
         # cannot remove them and they have no Lib/ file to check.
         needed = sorted(m for m in imported
