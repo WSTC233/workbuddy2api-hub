@@ -66,3 +66,6 @@ desktop.ini
 
 # Local Docker Compose override
 docker-compose.override.yml
+
+# activate-fixer.ps1 leaves the replaced file behind for diffing
+/*.preactivate
